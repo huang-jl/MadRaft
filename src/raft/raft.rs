@@ -1,4 +1,4 @@
-use futures::{channel::mpsc, stream::FuturesUnordered, StreamExt};
+use futures::{channel::mpsc, stream::FuturesUnordered, Future, StreamExt};
 use madsim::{
     fs, net,
     rand::{self, Rng},
@@ -7,7 +7,8 @@ use madsim::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt, io,
+    fmt::{self, Display},
+    io,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -19,6 +20,9 @@ pub struct RaftHandle {
 
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
 pub type MsgRecver = mpsc::UnboundedReceiver<ApplyMsg>;
+
+const HEARTBEAT_TIME: Duration = Duration::from_millis(200);
+const RPC_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -54,6 +58,12 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LogEntry {
+    entry: Vec<u8>,
+    term: u64,
+}
+
 struct Raft {
     peers: Vec<SocketAddr>,
     me: usize,
@@ -63,6 +73,8 @@ struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     state: State,
+    logs: Vec<LogEntry>,
+    recv_hb_from_last_check: bool,
 }
 
 /// State of a raft peer.
@@ -70,6 +82,10 @@ struct Raft {
 struct State {
     term: u64,
     role: Role,
+    // other state
+    vote_for: Option<usize>,
+    commit_index: u64,
+    last_applied: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +101,20 @@ impl Default for Role {
     }
 }
 
+impl Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "<Role: {}>",
+            match self {
+                Role::Follower => "Follower",
+                Role::Candidate => "Candidate",
+                Role::Leader => "Leader",
+            }
+        )
+    }
+}
+
 impl State {
     fn is_leader(&self) -> bool {
         matches!(self.role, Role::Leader)
@@ -95,6 +125,9 @@ impl State {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Persist {
     // Your data here.
+    term: u64,
+    vote_for: Option<usize>,
+    logs: Vec<LogEntry>,
 }
 
 impl fmt::Debug for Raft {
@@ -112,11 +145,15 @@ impl RaftHandle {
             me,
             apply_ch,
             state: State::default(),
+            logs: Vec::new(),
+            recv_hb_from_last_check: false,
         }));
         let handle = RaftHandle { inner };
         // initialize from state persisted before a crash
         handle.restore().await.expect("failed to restore");
         handle.start_rpc_server();
+
+        handle.prepare_deamon();
 
         (handle, recver)
     }
@@ -171,8 +208,18 @@ impl RaftHandle {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     async fn persist(&self) -> io::Result<()> {
-        let persist: Persist = todo!("persist state");
-        let snapshot: Vec<u8> = todo!("persist snapshot");
+        let (persist, snapshot): (Persist, Vec<u8>) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                Persist {
+                    term: inner.state.term,
+                    logs: inner.logs.clone(),
+                    vote_for: inner.state.vote_for,
+                },
+                Vec::new(),
+            )
+        };
+        // TODO implement snapshot
         let state = bincode::serialize(&persist).unwrap();
 
         // you need to store persistent state in file "state"
@@ -218,18 +265,113 @@ impl RaftHandle {
             let this = this.clone();
             async move { this.request_vote(args).await.unwrap() }
         });
-        // add more RPC handers here
+        // add more RPC handlers here
+        let this = self.clone();
+        net.add_rpc_handler(move |args: AppendEntriesArgs| {
+            let this = this.clone();
+            async move { this.request_append(args).await.unwrap() }
+        });
     }
 
+    fn prepare_deamon(&self) {
+        // start leader selection deamon
+        let this = self.clone();
+        task::spawn(async move { this.leader_selection_deamon().await }).detach();
+        // start heartbeat deamon
+        let this = self.clone();
+        task::spawn(async move { this.heartbeat_deamon().await }).detach();
+    }
+
+    /// rpc handler when getting vote request from candidates
     async fn request_vote(&self, args: RequestVoteArgs) -> Result<RequestVoteReply> {
         let reply = {
-            let mut this = self.inner.lock().unwrap();
-            this.request_vote(args)
+            let mut inner = self.inner.lock().unwrap();
+            inner.request_vote(args)
         };
         // if you need to persist or call async functions here,
         // make sure the lock is scoped and dropped.
         self.persist().await.expect("failed to persist");
         Ok(reply)
+    }
+
+    /// rpc handler when getting append request from leader
+    async fn request_append(&self, args: AppendEntriesArgs) -> Result<AppendEntriesReply> {
+        let reply = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.request_append(args)
+        };
+        self.persist().await.expect("failed to persist");
+        Ok(reply)
+    }
+
+    /// used for checking leader selection timeout periodically
+    async fn leader_selection_deamon(&self) {
+        loop {
+            sleep(Raft::generate_election_timeout()).await;
+            {
+                let mut inner = self.inner.lock().unwrap();
+                // if self is leader, do not issue leader selection
+                // if self is not leader and already recv heartbeat, do not issue leader selection
+                if inner.state.role == Role::Leader || inner.recv_hb_from_last_check {
+                    inner.recv_hb_from_last_check = false;
+                    continue;
+                } else {
+                    inner.state.role = Role::Candidate;
+                }
+            }
+            let mut rpcs;
+            {
+                let mut inner = self.inner.lock().unwrap();
+                rpcs = inner.send_vote_request();
+            }
+            let inner = Arc::clone(&self.inner);
+            task::spawn(async move {
+                let mut counter: usize = 1;
+                while let Some(res) = rpcs.next().await {
+                    if let Ok(res) = res {
+                        let mut inner = inner.lock().unwrap();
+                        if !inner.check_incoming_term(res.term) {
+                            break;
+                        }
+                        if res.vote_granted {
+                            counter += 1;
+                        }
+                        if counter > inner.peers.len()/2 {
+                            info!("Server {} become leader", inner.me);
+                            inner.state.role = Role::Leader;
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// used for send heartbeat peridodically
+    async fn heartbeat_deamon(&self) {
+        loop {
+            sleep(HEARTBEAT_TIME).await;
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.state.role != Role::Leader {
+                    continue;
+                }
+            }
+            let mut rpcs = self.inner.lock().unwrap().send_heartbeat();
+            let inner = Arc::clone(&self.inner);
+            task::spawn(async move {
+                while let Some(res) = rpcs.next().await {
+                    if let Ok(res) = res {
+                        let mut inner = inner.lock().unwrap();
+                        if !inner.check_incoming_term(res.term) {
+                            break;
+                        }
+                    }
+                    // TODO "Handle append successfully and what to do if failed"
+                }
+            })
+            .detach();
+        }
     }
 }
 
@@ -252,23 +394,91 @@ impl Raft {
         self.apply_ch.unbounded_send(msg).unwrap();
     }
 
+    /// Return true means pass the check: do not back to follower.
+    /// Return false means fail the check: back to follower
+    fn check_incoming_term(&mut self, incoming_term: u64) -> bool {
+        if incoming_term > self.state.term {
+            info!("Server {} with term = {} get larger term, back to follower", self.me, self.state.term);
+            self.state.term = incoming_term;
+            self.state.role = Role::Follower;
+            false
+        } else {
+            true
+        }
+    }
+
     fn request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
-        todo!("handle RequestVote RPC");
+        let mut reply = RequestVoteReply {
+            term: self.state.term,
+            vote_granted: true,
+        };
+        match self.state.term.cmp(&args.term) {
+            std::cmp::Ordering::Greater => reply.vote_granted = false,
+            std::cmp::Ordering::Equal => match self.state.vote_for {
+                None => self.state.vote_for = Some(args.candidate_id),
+                Some(vote_for) => {
+                    if vote_for != args.candidate_id {
+                        reply.vote_granted = false;
+                    }
+                }
+            },
+            std::cmp::Ordering::Less => {
+                self.state.vote_for = Some(args.candidate_id);
+            }
+        }
+        self.check_incoming_term(args.term);
+        info!(
+            "Server {}({}) get vote request from Server {} with term = {}, granted = {}",
+            self.me, self.state.role, args.candidate_id, args.term, reply.vote_granted,
+        );
+        reply
+    }
+
+    fn request_append(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+        // first clear timer
+        let mut reply = AppendEntriesReply {
+            term: self.state.term,
+            success: true,
+        };
+        match self.state.term.cmp(&args.term) {
+            std::cmp::Ordering::Greater => reply.success = false,
+            _ => {
+                self.recv_hb_from_last_check = true;
+                self.state.role = Role::Follower;
+            },
+        }
+        self.check_incoming_term(args.term);
+        // TODO: finish 2-5 on paper
+        info!(
+            "Server {}({}) get append request from Server {}, append_success = {}",
+            self.me, self.state.role, args.leader_id, reply.success
+        );
+        reply
     }
 
     // Here is an example to generate random number.
     fn generate_election_timeout() -> Duration {
         // see rand crate for more details
-        Duration::from_millis(rand::rng().gen_range(150..300))
+        Duration::from_millis(rand::rng().gen_range(1000..2000))
     }
 
     // Here is an example to send RPC and manage concurrent tasks.
-    fn send_vote_request(&mut self) {
-        let args: RequestVoteArgs = todo!("construct RPC request");
-        let timeout = Self::generate_election_timeout();
+    fn send_vote_request(
+        &mut self,
+    ) -> FuturesUnordered<impl Future<Output = std::result::Result<RequestVoteReply, std::io::Error>>>
+    {
+        let args: RequestVoteArgs = RequestVoteArgs {
+            term: {
+                self.state.term += 1;
+                self.state.term
+            },
+            candidate_id: self.me,
+            last_log_index: self.logs.len() as u64,
+            last_log_term: self.logs.last().map_or_else(|| 0, |log| log.term),
+        };
         let net = net::NetLocalHandle::current();
 
-        let mut rpcs = FuturesUnordered::new();
+        let rpcs = FuturesUnordered::new();
         for (i, &peer) in self.peers.iter().enumerate() {
             if i == self.me {
                 continue;
@@ -277,28 +487,97 @@ impl Raft {
             let net = net.clone();
             let args = args.clone();
             rpcs.push(async move {
-                net.call_timeout::<RequestVoteArgs, RequestVoteReply>(peer, args, timeout)
+                net.call_timeout::<RequestVoteArgs, RequestVoteReply>(peer, args, RPC_TIMEOUT)
                     .await
             });
         }
+        rpcs
 
-        // spawn a concurrent task
-        task::spawn(async move {
-            // handle RPC tasks in completion order
-            while let Some(res) = rpcs.next().await {
-                todo!("handle RPC results");
+        // let current_term = self.state.term;
+        // let bound = self.peers.len() / 2;
+        // // spawn a concurrent task
+        // task::spawn(async move {
+        //     // handle RPC tasks in completion order
+        //     let mut counter: usize = 0;
+        //     while let Some(res) = rpcs.next().await {
+        //         if let Ok(res) = res {
+        //             if res.vote_granted {
+        //                 counter += 1;
+        //             } else if res.term > current_term {
+        //                 break;
+        //             }
+        //             if counter > bound {
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // })
+        // .detach(); // NOTE: you need to detach a task explicitly, or it will be cancelled on drop
+    }
+
+    fn send_heartbeat(
+        &self,
+    ) -> FuturesUnordered<
+        impl Future<Output = std::result::Result<AppendEntriesReply, std::io::Error>>,
+    > {
+        assert_eq!(
+            self.state.role,
+            Role::Leader,
+            "Non-leader is sending AppendEntries RPC"
+        );
+        let args = AppendEntriesArgs {
+            term: self.state.term,
+            leader_id: self.me,
+            prev_log_index: self.logs.len() as u64,
+            prev_log_term: self.logs.last().map_or_else(|| 0, |log| log.term),
+            entries: Vec::new(),
+            leader_commit: self.state.commit_index,
+        };
+        let net = net::NetLocalHandle::current();
+        let rpcs = FuturesUnordered::new();
+        for (i, &peer) in self.peers.iter().enumerate() {
+            if i == self.me {
+                continue;
             }
-        })
-        .detach(); // NOTE: you need to detach a task explicitly, or it will be cancelled on drop
+            let net = net.clone();
+            let args = args.clone();
+            rpcs.push(async move {
+                net.call_timeout::<_, AppendEntriesReply>(peer, args, RPC_TIMEOUT)
+                    .await
+            });
+        }
+        rpcs
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestVoteArgs {
     // Your data here.
+    term: u64, // term for the candidate requesting vote
+    candidate_id: usize,
+    last_log_index: u64,
+    last_log_term: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestVoteReply {
     // Your data here.
+    term: u64, //term of the voter
+    vote_granted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppendEntriesArgs {
+    term: u64,
+    leader_id: usize,
+    prev_log_index: u64,
+    prev_log_term: u64,
+    entries: Vec<LogEntry>,
+    leader_commit: u64, //leader's commit_index
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppendEntriesReply {
+    term: u64,
+    success: bool,
 }
