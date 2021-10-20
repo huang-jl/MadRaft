@@ -360,7 +360,6 @@ async fn backup_2b() {
     for _i in 0..50 {
         let _ = t.start(leader2, random.gen_entry()).await;
     }
-    println!("leader 2 = {}", leader2);
 
     time::sleep(RAFT_ELECTION_TIMEOUT / 2).await;
 
@@ -371,7 +370,6 @@ async fn backup_2b() {
     t.connect((leader1 + 0) % servers);
     t.connect((leader1 + 1) % servers);
     t.connect(other);
-    println!("leader 1 = {}", leader1);
 
     // lots of successful commands to new group.
     for _i in 0..50 {
@@ -382,9 +380,7 @@ async fn backup_2b() {
     for i in 0..servers {
         t.connect(i);
     }
-    println!("connect all");
     t.one(random.gen_entry(), servers, true).await;
-    println!("finish");
 
     t.end();
 }

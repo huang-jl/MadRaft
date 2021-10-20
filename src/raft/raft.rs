@@ -191,7 +191,9 @@ impl RaftHandle {
     /// There is no guarantee that this command will ever be committed to the
     /// Raft log, since the leader may fail or lose an election.
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
-        self.inner.lock().unwrap().start(cmd)
+        let res = self.inner.lock().unwrap().start(cmd);
+        self.persist().await.unwrap();
+        res
     }
 
     /// The current term of this peer.
@@ -254,9 +256,9 @@ impl RaftHandle {
         // otherwise data will be lost on power fail.
         file.sync_all().await?;
 
-        let file = fs::File::create("snapshot").await?;
-        file.write_all_at(&snapshot, 0).await?;
-        file.sync_all().await?;
+        // let file = fs::File::create("snapshot").await?;
+        // file.write_all_at(&snapshot, 0).await?;
+        // file.sync_all().await?;
         Ok(())
     }
 
@@ -272,7 +274,7 @@ impl RaftHandle {
         match fs::read("state").await {
             Ok(state) => {
                 let persist: Persist = bincode::deserialize(&state).unwrap();
-                todo!("restore state");
+                self.inner.lock().unwrap().restore(persist);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -347,6 +349,7 @@ impl RaftHandle {
                 }
             }
             let mut rpcs = self.inner.lock().unwrap().send_vote_request();
+            self.persist().await.unwrap();
             let inner = Arc::clone(&self.inner);
             let this = self.clone();
             task::spawn(async move {
@@ -415,7 +418,13 @@ impl RaftHandle {
                             raft.update_next_index(peer_id, last_send_entry_id + 1);
                             raft.update_match_index(peer_id, last_send_entry_id);
                         } else {
-                            raft.next_index[peer_id] = (next_id - 1).min(raft.next_index[peer_id]);
+                            let next_index = {
+                                match res.conflict.term {
+                                    Some(_) => raft.get_next_index(next_id - 1, res.conflict),
+                                    None => res.conflict.first_index,
+                                }
+                            };
+                            raft.next_index[peer_id] = next_index.min(raft.next_index[peer_id]);
                             info!("[Append] Leader {} append to {} failed due to log inconsistency, next_index = {}",
                                 raft.me, peer_id, raft.next_index[peer_id]);
                         }
@@ -605,6 +614,13 @@ impl Raft {
             }
         }
         if self.is_more_up_to_date(args.last_log_term, args.last_log_index) {
+            info!(
+                "[Vote] S{}(last_term = {}, last_index = {}) more update that S{}",
+                self.me,
+                self.last_log_term(),
+                self.last_log_index(),
+                args.candidate_id
+            );
             reply.vote_granted = false;
         }
         if reply.vote_granted {
@@ -612,8 +628,8 @@ impl Raft {
             self.state.term = self.state.term.max(args.term);
         }
         info!(
-            "[Vote] Server {}({}) term = {} get vote request from Server {} with term = {}, granted = {}",
-            self.me, self.state.role, reply.term, args.candidate_id, args.term, reply.vote_granted,
+            "[Vote] S{}({}) term = {} get vote request from S{}: {:?}, granted = {}",
+            self.me, self.state.role, reply.term, args.candidate_id, args, reply.vote_granted,
         );
         reply
     }
@@ -623,9 +639,13 @@ impl Raft {
         let mut reply = AppendEntriesReply {
             term: self.state.term,
             success: true,
+            conflict: ConflictInfo {
+                term: None,
+                first_index: self.last_log_index() + 1,
+            },
         };
         info!(
-            "[Append] S{}(term = {}) get append request from S{}: {:?}",
+            "[Append] S{}(term = {}) get append request from S{}: {}",
             self.me, self.state.term, args.leader_id, args
         );
         match self.state.term.cmp(&args.term) {
@@ -638,11 +658,14 @@ impl Raft {
                 if let Some(log) = self.logs.get(args.prev_log_index as usize) {
                     if log.term != args.prev_log_term {
                         reply.success = false;
+                        reply.conflict = ConflictInfo {
+                            term: Some(log.term),
+                            first_index: self.get_first_index_of_term(log.term).unwrap(),
+                        };
                         self.logs.truncate(args.prev_log_index as usize);
                     } else {
                         // append success:
-                        self.logs.truncate(args.prev_log_index as usize + 1);
-                        self.logs.append(&mut args.entries);
+                        self.append_logs(args.entries, args.prev_log_index);
                         // update commit index
                         if args.leader_commit > self.state.commit_index {
                             self.state.commit_index = args.leader_commit.min(self.last_log_index());
@@ -726,6 +749,46 @@ impl Raft {
             Less => false,
         }
     }
+    fn restore(&mut self, persist: Persist) {
+        info!("[Restore] S{} restore", self.me);
+        self.state.term = persist.term;
+        self.state.vote_for = persist.vote_for;
+        self.logs = persist.logs;
+    }
+    fn append_logs(&mut self, new_entries: Vec<LogEntry>, prev_index: u64) {
+        let logs = &mut self.logs;
+        let mut index = prev_index as usize + 1;
+        for new_log in new_entries.into_iter() {
+            match logs.get(index) {
+                Some(log) => {
+                    if log.term != new_log.term {
+                        logs.truncate(index);
+                        logs.push(new_log);
+                    }
+                }
+                None => logs.push(new_log),
+            }
+            index += 1;
+        }
+    }
+    /// Return first index of log whose term is the same as `term`
+    fn get_first_index_of_term(&self, target_term: u64) -> Option<u64> {
+        for (i, log) in self.logs.iter().enumerate() {
+            if log.term == target_term {
+                return Some(i as u64);
+            }
+        }
+        None
+    }
+    /// Return new `next_index` when leader get a failed append reply
+    fn get_next_index(&self, conflict_index: u64, follower_conflict_info: ConflictInfo) -> u64 {
+        for i in (follower_conflict_info.first_index..conflict_index - 1).rev() {
+            if self.logs[i as usize].term == follower_conflict_info.term.unwrap() {
+                return i + 1;
+            }
+        }
+        follower_conflict_info.first_index
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,8 +817,23 @@ struct AppendEntriesArgs {
     leader_commit: u64, //leader's commit_index
 }
 
+impl Display for AppendEntriesArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AppendArgs[{} entries] {{ term: {}, leader_id: {}, prev_log_index: {}, prev_log_term: {}, leader_commit: {}}}",
+    self.entries.len(), self.term, self.leader_id, self.prev_log_index, self.prev_log_term, self.leader_commit)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppendEntriesReply {
     term: u64,
     success: bool,
+    //.0 is term and .1 is index
+    conflict: ConflictInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConflictInfo {
+    term: Option<u64>, //None means there is no log entry in AppendEntriesArgs's prev_log_index
+    first_index: u64,  //if term is None, first_index is last_log_index + 1
 }
