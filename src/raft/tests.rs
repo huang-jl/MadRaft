@@ -874,7 +874,7 @@ async fn snap_common(disconnect: bool, reliable: bool, crash: bool) {
             sender = (leader1 + 1) % servers;
             victim = leader1;
         }
-
+        // info!("[Test] Iter {} start, victim = S{}", i, victim);
         if disconnect {
             t.disconnect(victim);
             t.one(random.gen_entry(), servers - 1, true).await;
@@ -884,11 +884,13 @@ async fn snap_common(disconnect: bool, reliable: bool, crash: bool) {
             t.one(random.gen_entry(), servers - 1, true).await;
         }
         // send enough to get a snapshot
+        // info!("[Test] Iter {} prepare done", i);
         for _ in 0..=SNAPSHOT_INTERVAL {
             let _ = t.start(sender, random.gen_entry()).await;
         }
         // let applier threads catch up with the Start()'s
         t.one(random.gen_entry(), servers - 1, true).await;
+        // info!("[Test] Iter {} catch up done", i);
 
         let log_size = t.log_size();
         assert!(log_size < MAX_LOG_SIZE, "log size too large: {}", log_size);
@@ -897,15 +899,18 @@ async fn snap_common(disconnect: bool, reliable: bool, crash: bool) {
             // reconnect a follower, who maybe behind and
             // needs to receive a snapshot to catch up.
             t.connect(victim);
+            // info!("[Test] Iter {} S{} (disconnected) rejoin", i, victim);
             t.one(random.gen_entry(), servers, true).await;
             leader1 = t.check_one_leader().await;
         }
         if crash {
             t.start1_snapshot(victim).await;
             t.connect(victim);
+            // info!("[Test] Iter {} S{} (crashed) rejoin", i, victim);
             t.one(random.gen_entry(), servers, true).await;
             leader1 = t.check_one_leader().await;
         }
+        // info!("[Test] Iter {} finish", i);
     }
     t.end();
 }
