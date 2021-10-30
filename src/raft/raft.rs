@@ -352,7 +352,6 @@ impl RaftHandle {
 
     /// rpc handler when getting vote request from candidates
     async fn request_vote(&self, args: RequestVoteArgs) -> Result<RequestVoteReply> {
-        let temp = args.clone();
         let reply = {
             let mut raft = self.inner.lock().unwrap();
             raft.request_vote(args)
