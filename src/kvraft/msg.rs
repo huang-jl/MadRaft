@@ -7,6 +7,7 @@ pub enum Op {
     Append { key: String, value: String },
 }
 
+
 #[derive(thiserror::Error, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Error {
     #[error("not leader, hint: {hint}")]
@@ -15,4 +16,11 @@ pub enum Error {
     Timeout,
     #[error("failed to reach consensus")]
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClerkReq<T> {
+    pub req: T,
+    pub client: String, //client unique identifier
+    pub rid: u64, //request id
 }

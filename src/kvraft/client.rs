@@ -1,6 +1,9 @@
 use super::msg::*;
 use madsim::{net, time::*};
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub struct Clerk {
     core: ClerkCore<Op, String>,
@@ -31,8 +34,11 @@ impl Clerk {
 
 pub struct ClerkCore<Req, Rsp> {
     servers: Vec<SocketAddr>,
+    rid: AtomicU64, // request id, monotonically increasing
     _mark: std::marker::PhantomData<(Req, Rsp)>,
 }
+
+const LOOP_LIMIT: i32 = 2;
 
 impl<Req, Rsp> ClerkCore<Req, Rsp>
 where
@@ -41,23 +47,56 @@ where
 {
     pub fn new(servers: Vec<SocketAddr>) -> Self {
         ClerkCore {
+            rid: AtomicU64::new(0),
             servers,
             _mark: std::marker::PhantomData,
         }
     }
 
+    /// Question: What is the diff between kvraft::Error::Timeout and call_timeout's io::Error
     pub async fn call(&self, args: Req) -> Rsp {
         let net = net::NetLocalHandle::current();
-        for i in 0..self.servers.len() {
+        let rid = self.rid.fetch_add(1, Ordering::Relaxed);
+        let args = ClerkReq {
+            req: args,
+            client: net.local_addr().to_string(),
+            rid,
+        };
+        let (mut old_s, mut s) = (0, 0);
+        let mut iter_times = 0;
+        loop {
+            info!("[KVClerk] call S{}, with args = {:?}", s, args);
+            old_s = s;
             let ret = net
-                .call_timeout::<Req, Result<Rsp, Error>>(
-                    self.servers[i],
+                .call_timeout::<ClerkReq<Req>, Result<Rsp, Error>>(
+                    self.servers[s],
                     args.clone(),
                     Duration::from_millis(500),
                 )
                 .await;
-            todo!("handle RPC results");
+            info!("[KVClerk] call S{} get response = {:?}", s, ret);
+            if let Ok(ret) = ret {
+                match ret {
+                    Ok(reply) => return reply,
+                    Err(err) => match err {
+                        Error::NotLeader { hint } => s = hint,
+                        Error::Failed => {},
+                        Error::Timeout => s = (s + 1) % self.servers.len(),
+                    },
+                }
+            } else {
+                s = (s + 1) % self.servers.len();
+            }
+            // optimiazation for partition
+            if s == old_s {
+                iter_times += 1;
+            } else {
+                iter_times = 0;
+            }
+            if iter_times > LOOP_LIMIT {
+                s = (s + 1) % self.servers.len();
+                iter_times = 0;
+            }
         }
-        todo!("handle RPC results");
     }
 }

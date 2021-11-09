@@ -581,7 +581,8 @@ impl RaftHandle {
 impl Raft {
     fn start(&mut self, data: &[u8]) -> Result<Start> {
         if !self.state.is_leader() {
-            return Err(Error::NotLeader(self.me));
+            let server_num = self.peers.len();
+            return Err(Error::NotLeader(self.state.vote_for.unwrap_or((self.me + 1) % server_num)));
         }
         self.logs.push(LogEntry::new(data, self.state.term));
         info!(
