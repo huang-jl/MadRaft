@@ -4,19 +4,24 @@ use futures::StreamExt;
 use madsim::{
     net, task,
     time::{self, Instant},
+    Handle,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fmt::{self, Debug},
+    fmt::Debug,
     marker::PhantomData,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 const APPLY_CHECK_PERIOD: Duration = Duration::from_millis(25);
 const APPLY_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
+const SNAPSHOT_CHECK_PERIOD: Duration = Duration::from_millis(250);
 
 pub trait State: net::Message + Default {
     type Command: net::Message + Clone;
@@ -25,18 +30,20 @@ pub trait State: net::Message + Default {
     fn apply(&mut self, cmd: Self::Command) -> Self::Output;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecentInfo<T> {
+    rid: u64, // client's recent request id
+    // response: Option<T>, // client's response corresponding to rid
+    response: T, // client's response corresponding to rid
+}
+
 pub struct Server<S: State> {
     rf: raft::RaftHandle,
     me: usize,
     // _marker: PhantomData<S>,
     state: Mutex<S>,
-    cstate: Mutex<HashMap<String, ClientRecentResponse<S::Output>>>,
-}
-
-impl<S: State> fmt::Debug for Server<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Server({})", self.me)
-    }
+    cstate: Mutex<HashMap<String, RecentInfo<S::Output>>>,
+    recent_apply_index: AtomicU64, //used for snapshpt
 }
 
 impl<S: State> Server<S> {
@@ -46,17 +53,58 @@ impl<S: State> Server<S> {
         max_raft_state: Option<usize>,
     ) -> Arc<Self> {
         // You may need initialization code here.
-        let (rf, apply_ch) = raft::RaftHandle::new(servers, me).await;
+        let my_addr = servers[me];
+        let (rf, mut apply_ch) = raft::RaftHandle::new(servers, me).await;
         let this = Arc::new(Server {
             rf,
             me,
             // _marker: PhantomData,
             state: Mutex::new(S::default()),
             cstate: Mutex::new(HashMap::new()),
+            recent_apply_index: AtomicU64::new(0),
         });
+        this.restore(&mut apply_ch).await;
         this.start_rpc_server();
-        this.start_recv_from_raft_deamon(apply_ch);
+        this.prepare_deamon(apply_ch, my_addr, max_raft_state);
         this
+    }
+
+    fn prepare_deamon(
+        self: &Arc<Self>,
+        apply_ch: MsgRecver,
+        my_addr: SocketAddr,
+        max_raft_state: Option<usize>,
+    ) {
+        let this = self.clone();
+        task::spawn(async move {
+            this.start_recv_from_raft_deamon(apply_ch).await;
+        })
+        .detach();
+
+        let this = self.clone();
+        if max_raft_state.is_some() {
+            task::spawn(async move {
+                this.snapshot_check_deamon(my_addr, max_raft_state.unwrap())
+                    .await
+            })
+            .detach();
+        }
+    }
+
+    async fn restore(self: &Arc<Self>, recver: &mut MsgRecver) {
+        match recver.next().await.unwrap() {
+            ApplyMsg::Command { .. } => {
+                panic!("[KvServer] S{} get ApplyMsg::Command when restore", self.me)
+            }
+            ApplyMsg::Snapshot { data, index, term } => {
+                self.recent_apply_index.store(index, Ordering::Release);
+                if index > 0 && term > 0 {
+                    let (state, cstate) = bincode::deserialize(&data).unwrap();
+                    *self.state.lock().unwrap() = state;
+                    *self.cstate.lock().unwrap() = cstate;
+                }
+            }
+        }
     }
 
     fn start_rpc_server(self: &Arc<Self>) {
@@ -69,33 +117,66 @@ impl<S: State> Server<S> {
         });
     }
 
-    fn start_recv_from_raft_deamon(self: &Arc<Self>, mut recver: MsgRecver) {
-        let this = self.clone();
-        task::spawn(async move {
-            while let Some(msg) = recver.next().await {
-                match msg {
-                    ApplyMsg::Command { data, .. } => {
-                        let command: ClerkReq<S::Command> = bincode::deserialize(&data).unwrap();
-                        let mut cstate = this.cstate.lock().unwrap();
-                        match cstate.get_mut(&command.client) {
-                            Some(res) if res.rid == command.rid => {}
-                            _ => {
-                                info!("[KVServer] S{} apply {:?}", this.me, command);
-                                cstate.insert(
-                                    command.client,
-                                    ClientRecentResponse {
-                                        rid: command.rid,
-                                        response: this.state.lock().unwrap().apply(command.req),
-                                    },
+    async fn start_recv_from_raft_deamon(self: Arc<Self>, mut recver: MsgRecver) {
+        while let Some(msg) = recver.next().await {
+            match msg {
+                ApplyMsg::Command { data, index } => {
+                    // update state
+                    let command: ClerkReq<S::Command> = bincode::deserialize(&data).unwrap();
+                    let mut cstate = self.cstate.lock().unwrap();
+                    match cstate.get_mut(&command.client) {
+                        Some(res) if res.rid == command.rid => {}
+                        _ => {
+                            info!("[KVServer] S{} apply {:?}", self.me, command);
+                            cstate.insert(
+                                command.client,
+                                RecentInfo {
+                                    rid: command.rid,
+                                    response: self.state.lock().unwrap().apply(command.req),
+                                },
+                            );
+                        }
+                    }
+                    // update recent_apply_index for snapshot
+                    self.recent_apply_index.store(index, Ordering::Release);
+                }
+                ApplyMsg::Snapshot { data, index, term } => {
+                    if self.rf.cond_install_snapshot(term, index, &data).await {
+                        match bincode::deserialize(&data) {
+                            Ok((state, cstate)) => {
+                                *self.state.lock().unwrap() = state;
+                                *self.cstate.lock().unwrap() = cstate;
+                                self.recent_apply_index.store(index, Ordering::Release);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "[KvServer] S{} Deserialize Snapshot get err = {:?}",
+                                    self.me, err
                                 );
                             }
                         }
                     }
-                    ApplyMsg::Snapshot { data, index, term } => {}
                 }
             }
-        })
-        .detach();
+        }
+    }
+
+    async fn snapshot_check_deamon(self: Arc<Self>, my_addr: SocketAddr, max_raft_state: usize) {
+        let fs = Handle::current().fs;
+        loop {
+            time::sleep(SNAPSHOT_CHECK_PERIOD).await;
+            if matches!(fs.get_file_size(my_addr, "state"), Ok(size) if size as usize > max_raft_state)
+            {
+                let snapshot = {
+                    let state = (&*self.state.lock().unwrap(), &*self.cstate.lock().unwrap());
+                    bincode::serialize(&state).unwrap()
+                };
+                self.rf
+                    .snapshot(self.recent_apply_index.load(Ordering::Acquire), &snapshot)
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     /// The current term of this peer.
@@ -130,7 +211,7 @@ impl<S: State> Server<S> {
         while t.elapsed() < APPLY_CHECK_TIMEOUT {
             time::sleep(APPLY_CHECK_PERIOD).await;
             match self.cstate.lock().unwrap().get(&cmd.client) {
-                Some(ClientRecentResponse { rid, response, .. }) if *rid == cmd.rid => {
+                Some(RecentInfo { rid, response, .. }) if *rid == cmd.rid => {
                     return Ok(response.clone());
                 }
                 _ => {}
@@ -141,13 +222,6 @@ impl<S: State> Server<S> {
 }
 
 pub type KvServer = Server<Kv>;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ClientRecentResponse<T> {
-    rid: u64, // client's recent request id
-    // response: Option<T>, // client's response corresponding to rid
-    response: T, // client's response corresponding to rid
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Kv {

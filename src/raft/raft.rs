@@ -28,7 +28,7 @@ fn generate_election_timeout() -> Duration {
 const APPEND_PERIOD: Duration = Duration::from_millis(50);
 const APPLY_PERIOD: Duration = Duration::from_millis(50);
 const COMMIT_CHECK_PERIOD: Duration = Duration::from_millis(50);
-const RPC_TIMEOUT: Duration = Duration::from_millis(50);    // This value is important. If it is too small, your request may not get response and will finially leading to test timeout.
+const RPC_TIMEOUT: Duration = Duration::from_millis(50); // This value is important. If it is too small, your request may not get response and will finially leading to test timeout.
 const INSALL_SNAPSHPT_CHECK_PERIOD: Duration = Duration::from_millis(250);
 const MAX_APPLIED_ONCE: usize = 10;
 
@@ -232,6 +232,8 @@ impl RaftHandle {
         snapshot: &[u8],
     ) -> bool {
         let mut raft = self.inner.lock().unwrap();
+        // 1.If server already applied newer log than snapshot, then we cannot roll back to stale snapshot
+        // 2.If server already applied newer snapshot, it should refuse to install stale snapshot
         if raft.state.last_applied > last_included_index
             || last_included_index <= raft.state.last_included_index
         {
@@ -247,6 +249,7 @@ impl RaftHandle {
         raft.trim_before_log_index(last_included_index);
         raft.state.last_included_index = last_included_index;
         raft.state.last_applied = last_included_index;
+        raft.state.commit_index = raft.state.commit_index.max(last_included_index);
         true
     }
 
@@ -312,6 +315,14 @@ impl RaftHandle {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        // send Snapshot command to Service
+        let raft = self.inner.lock().unwrap();
+        let msg = ApplyMsg::Snapshot {
+            data: raft.snapshot.clone(),
+            index: raft.state.last_included_index,
+            term: raft.state.last_included_term,
+        };
+        raft.apply_ch.unbounded_send(msg).unwrap();
         Ok(())
     }
 
@@ -582,7 +593,9 @@ impl Raft {
     fn start(&mut self, data: &[u8]) -> Result<Start> {
         if !self.state.is_leader() {
             let server_num = self.peers.len();
-            return Err(Error::NotLeader(self.state.vote_for.unwrap_or((self.me + 1) % server_num)));
+            return Err(Error::NotLeader(
+                self.state.vote_for.unwrap_or((self.me + 1) % server_num),
+            ));
         }
         self.logs.push(LogEntry::new(data, self.state.term));
         info!(
@@ -931,6 +944,7 @@ impl Raft {
         self.state.last_included_term = persist.last_include_term;
         self.state.last_included_index = persist.last_include_index;
         self.state.last_applied = persist.last_include_index;
+        self.state.commit_index = persist.last_include_index;
     }
     /// Check whether leader's log at AppendRPCArg.prev_index match with local logs
     ///

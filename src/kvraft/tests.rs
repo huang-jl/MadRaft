@@ -427,6 +427,7 @@ async fn snapshot_rpc_3b() {
         maxraftstate,
     );
 
+
     // now make group that requires participation of
     // lagging server, so that it has to catch up.
     t.partition(&[0, 2], &[1]);
