@@ -35,6 +35,7 @@ impl Clerk {
 pub struct ClerkCore<Req, Rsp> {
     servers: Vec<SocketAddr>,
     rid: AtomicU64, // request id, monotonically increasing
+    cid: String,
     _mark: std::marker::PhantomData<(Req, Rsp)>,
 }
 
@@ -49,6 +50,7 @@ where
         ClerkCore {
             rid: AtomicU64::new(0),
             servers,
+            cid: format!("{}", rand::random::<u64>()),
             _mark: std::marker::PhantomData,
         }
     }
@@ -56,16 +58,17 @@ where
     /// Question: What is the diff between kvraft::Error::Timeout and call_timeout's io::Error
     pub async fn call(&self, args: Req) -> Rsp {
         let net = net::NetLocalHandle::current();
-        let rid = self.rid.fetch_add(1, Ordering::Relaxed);
+        let rid = self.rid.fetch_add(1, Ordering::AcqRel);
         let args = ClerkReq {
             req: args,
-            client: net.local_addr().to_string(),
+            client: self.cid.clone(),
             rid,
         };
-        let (mut old_s, mut s) = (0, 0);
+        let mut old_s;
+        let mut s = 0;
         let mut iter_times = 0;
         loop {
-            info!("[KVClerk] call S{}, with args = {:?}", s, args);
+            info!("[Clerk] call S{}, with args = {:?}", s, args);
             old_s = s;
             let ret = net
                 .call_timeout::<ClerkReq<Req>, Result<Rsp, Error>>(
@@ -74,7 +77,7 @@ where
                     Duration::from_millis(500),
                 )
                 .await;
-            info!("[KVClerk] call S{} get response = {:?}", s, ret);
+            info!("[Clerk] call S{} get response = {:?}", s, ret);
             if let Ok(ret) = ret {
                 match ret {
                     Ok(reply) => return reply,

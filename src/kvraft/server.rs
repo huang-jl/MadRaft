@@ -1,5 +1,5 @@
 use super::msg::*;
-use crate::raft::{self, ApplyMsg, MsgRecver, Start};
+use crate::raft::{self, ApplyMsg, MsgRecver};
 use futures::StreamExt;
 use madsim::{
     net, task,
@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt::Debug,
-    marker::PhantomData,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -94,7 +93,7 @@ impl<S: State> Server<S> {
     async fn restore(self: &Arc<Self>, recver: &mut MsgRecver) {
         match recver.next().await.unwrap() {
             ApplyMsg::Command { .. } => {
-                panic!("[KvServer] S{} get ApplyMsg::Command when restore", self.me)
+                panic!("[AppServer] S{} get ApplyMsg::Command when restore", self.me)
             }
             ApplyMsg::Snapshot { data, index, term } => {
                 self.recent_apply_index.store(index, Ordering::Release);
@@ -127,7 +126,7 @@ impl<S: State> Server<S> {
                     match cstate.get_mut(&command.client) {
                         Some(res) if res.rid == command.rid => {}
                         _ => {
-                            info!("[KVServer] S{} apply {:?}", self.me, command);
+                            info!("[AppServer] S{} apply log[{}] {:?}", self.me, index, command);
                             cstate.insert(
                                 command.client,
                                 RecentInfo {
@@ -150,7 +149,7 @@ impl<S: State> Server<S> {
                             }
                             Err(err) => {
                                 warn!(
-                                    "[KvServer] S{} Deserialize Snapshot get err = {:?}",
+                                    "[AppServer] S{} Deserialize Snapshot get err = {:?}",
                                     self.me, err
                                 );
                             }
@@ -191,7 +190,7 @@ impl<S: State> Server<S> {
 
     async fn apply(&self, cmd: ClerkReq<S::Command>) -> Result<S::Output, Error> {
         let t = Instant::now();
-        info!("[KVServer] S{} get new cmd = {:?}", self.me, cmd);
+        info!("[AppServer] S{} get new cmd = {:?}", self.me, cmd);
         match self.cstate.lock().unwrap().get(&cmd.client) {
             Some(cres) => {
                 if cres.rid == cmd.rid {
