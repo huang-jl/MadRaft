@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use super::{msg::*, N_SHARDS};
-use crate::kvraft::server::{Server, State};
+use crate::kvraft::{
+    msg::ClerkReq,
+    server::{RecentInfo, Server, State},
+};
 use serde::{Deserialize, Serialize};
 
 pub type ShardCtrler = Server<ShardInfo>;
@@ -10,14 +13,15 @@ pub type ShardCtrler = Server<ShardInfo>;
 pub struct ShardInfo {
     // Your data here.
     configs: Vec<Config>,
+    client: HashMap<String, RecentInfo<Option<Config>>>,
 }
 
 impl State for ShardInfo {
     type Command = Op;
     type Output = Option<Config>;
 
-    fn apply(&mut self, cmd: Self::Command) -> Self::Output {
-        match cmd {
+    fn apply(&mut self, cmd: ClerkReq<Self::Command>) -> Self::Output {
+        let res = match cmd.req {
             Op::Join { groups } => {
                 let mut config = self.configs.last().unwrap().clone();
                 for (gid, servers) in groups.into_iter() {
@@ -72,6 +76,25 @@ impl State for ShardInfo {
                     self.configs.get(num).cloned()
                 }
             }
+        };
+        self.client.insert(
+            cmd.client,
+            RecentInfo {
+                response: res.clone(),
+                rid: cmd.rid,
+            },
+        );
+        res
+    }
+
+    fn name() -> &'static str {
+        "[ShardCtrl]"
+    }
+
+    fn duplicate(&self, req: &ClerkReq<Self::Command>) -> Option<Self::Output> {
+        match self.client.get(&req.client) {
+            Some(RecentInfo { response, rid }) if *rid == req.rid => Some(response.clone()),
+            _ => None,
         }
     }
 }
@@ -84,6 +107,7 @@ impl Default for ShardInfo {
                 shards: [0; N_SHARDS],
                 groups: HashMap::new(),
             }],
+            client: HashMap::new(),
         }
     }
 }

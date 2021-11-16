@@ -1,5 +1,9 @@
 use super::msg::*;
-use crate::raft::{self, ApplyMsg, MsgRecver};
+use crate::{
+    raft::{self, ApplyMsg, MsgRecver},
+    shard_ctrler::msg::ConfigId,
+    shardkv::server::ShardKv,
+};
 use futures::StreamExt;
 use madsim::{
     net, task,
@@ -26,14 +30,20 @@ pub trait State: net::Message + Default {
     type Command: net::Message + Clone;
     type Output: net::Message + Clone;
     /// apply normal operation (non-register) to state machine
-    fn apply(&mut self, cmd: Self::Command) -> Self::Output;
+    fn apply(&mut self, cmd: ClerkReq<Self::Command>) -> Self::Output;
+    fn name() -> &'static str;
+    /// Return None if this request is not duplicated,
+    /// or return the corresponding response.
+    ///
+    /// We let the `State` itself to manage the duplication detect for flexibility.
+    fn duplicate(&self, req: &ClerkReq<Self::Command>) -> Option<Self::Output>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RecentInfo<T> {
-    rid: u64, // client's recent request id
+pub struct RecentInfo<T> {
+    pub rid: u64, // client's recent request id
     // response: Option<T>, // client's response corresponding to rid
-    response: T, // client's response corresponding to rid
+    pub response: T, // client's response corresponding to rid
 }
 
 pub struct Server<S: State> {
@@ -41,7 +51,6 @@ pub struct Server<S: State> {
     me: usize,
     // _marker: PhantomData<S>,
     state: Mutex<S>,
-    cstate: Mutex<HashMap<String, RecentInfo<S::Output>>>,
     recent_apply_index: AtomicU64, //used for snapshpt
 }
 
@@ -59,7 +68,6 @@ impl<S: State> Server<S> {
             me,
             // _marker: PhantomData,
             state: Mutex::new(S::default()),
-            cstate: Mutex::new(HashMap::new()),
             recent_apply_index: AtomicU64::new(0),
         });
         this.restore(&mut apply_ch).await;
@@ -93,14 +101,17 @@ impl<S: State> Server<S> {
     async fn restore(self: &Arc<Self>, recver: &mut MsgRecver) {
         match recver.next().await.unwrap() {
             ApplyMsg::Command { .. } => {
-                panic!("[AppServer] S{} get ApplyMsg::Command when restore", self.me)
+                panic!(
+                    "{} S{} get ApplyMsg::Command when restore",
+                    S::name(),
+                    self.me
+                )
             }
             ApplyMsg::Snapshot { data, index, term } => {
                 self.recent_apply_index.store(index, Ordering::Release);
                 if index > 0 && term > 0 {
-                    let (state, cstate) = bincode::deserialize(&data).unwrap();
+                    let state = bincode::deserialize(&data).unwrap();
                     *self.state.lock().unwrap() = state;
-                    *self.cstate.lock().unwrap() = cstate;
                 }
             }
         }
@@ -122,18 +133,11 @@ impl<S: State> Server<S> {
                 ApplyMsg::Command { data, index } => {
                     // update state
                     let command: ClerkReq<S::Command> = bincode::deserialize(&data).unwrap();
-                    let mut cstate = self.cstate.lock().unwrap();
-                    match cstate.get_mut(&command.client) {
-                        Some(res) if res.rid == command.rid => {}
-                        _ => {
-                            info!("[AppServer] S{} apply log[{}] {:?}", self.me, index, command);
-                            cstate.insert(
-                                command.client,
-                                RecentInfo {
-                                    rid: command.rid,
-                                    response: self.state.lock().unwrap().apply(command.req),
-                                },
-                            );
+                    let mut state = self.state.lock().unwrap();
+                    match state.duplicate(&command) {
+                        Some(..) => {}
+                        None => {
+                            state.apply(command);
                         }
                     }
                     // update recent_apply_index for snapshot
@@ -142,15 +146,16 @@ impl<S: State> Server<S> {
                 ApplyMsg::Snapshot { data, index, term } => {
                     if self.rf.cond_install_snapshot(term, index, &data).await {
                         match bincode::deserialize(&data) {
-                            Ok((state, cstate)) => {
+                            Ok(state) => {
                                 *self.state.lock().unwrap() = state;
-                                *self.cstate.lock().unwrap() = cstate;
                                 self.recent_apply_index.store(index, Ordering::Release);
                             }
                             Err(err) => {
                                 warn!(
-                                    "[AppServer] S{} Deserialize Snapshot get err = {:?}",
-                                    self.me, err
+                                    "{} S{} Deserialize Snapshot get err = {:?}",
+                                    S::name(),
+                                    self.me,
+                                    err
                                 );
                             }
                         }
@@ -167,7 +172,7 @@ impl<S: State> Server<S> {
             if matches!(fs.get_file_size(my_addr, "state"), Ok(size) if size as usize > max_raft_state)
             {
                 let snapshot = {
-                    let state = (&*self.state.lock().unwrap(), &*self.cstate.lock().unwrap());
+                    let state = &*self.state.lock().unwrap();
                     bincode::serialize(&state).unwrap()
                 };
                 self.rf
@@ -190,14 +195,10 @@ impl<S: State> Server<S> {
 
     async fn apply(&self, cmd: ClerkReq<S::Command>) -> Result<S::Output, Error> {
         let t = Instant::now();
-        info!("[AppServer] S{} get new cmd = {:?}", self.me, cmd);
-        match self.cstate.lock().unwrap().get(&cmd.client) {
-            Some(cres) => {
-                if cres.rid == cmd.rid {
-                    return Ok(cres.response.clone());
-                }
-            }
-            _ => {}
+        info!("{} S{} get new cmd = {:?}", S::name(), self.me, cmd);
+        match self.state.lock().unwrap().duplicate(&cmd) {
+            Some(res) => return Ok(res),
+            None => {}
         }
         let cmd_data = bincode::serialize(&cmd).unwrap();
         match self.rf.start(&cmd_data).await {
@@ -209,10 +210,8 @@ impl<S: State> Server<S> {
         }
         while t.elapsed() < APPLY_CHECK_TIMEOUT {
             time::sleep(APPLY_CHECK_PERIOD).await;
-            match self.cstate.lock().unwrap().get(&cmd.client) {
-                Some(RecentInfo { rid, response, .. }) if *rid == cmd.rid => {
-                    return Ok(response.clone());
-                }
+            match self.state.lock().unwrap().duplicate(&cmd) {
+                Some(res) => return Ok(res),
                 _ => {}
             }
         }
@@ -222,17 +221,18 @@ impl<S: State> Server<S> {
 
 pub type KvServer = Server<Kv>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Kv {
     // Your data here.
     kv: HashMap<String, String>,
+    client: HashMap<String, RecentInfo<String>>,
 }
 
 impl State for Kv {
     type Command = Op;
     type Output = String;
-    fn apply(&mut self, cmd: Self::Command) -> Self::Output {
-        match cmd {
+    fn apply(&mut self, cmd: ClerkReq<Self::Command>) -> Self::Output {
+        let res = match cmd.req {
             Op::Get { key } => self
                 .kv
                 .get(&key)
@@ -249,12 +249,41 @@ impl State for Kv {
                 }
                 String::from("")
             }
+        };
+        self.client.insert(
+            cmd.client,
+            RecentInfo {
+                response: res.clone(),
+                rid: cmd.rid,
+            },
+        );
+        res
+    }
+
+    fn name() -> &'static str {
+        "[Kv]"
+    }
+
+    fn duplicate(&self, req: &ClerkReq<Self::Command>) -> Option<Self::Output> {
+        match self.client.get(&req.client) {
+            Some(RecentInfo { rid, response }) if *rid == req.rid => Some(response.clone()),
+            _ => None,
         }
     }
 }
 
-impl Default for Kv {
-    fn default() -> Self {
-        Kv { kv: HashMap::new() }
+impl Server<ShardKv> {
+    /// `sid`: The shard id that the current server is responsible for
+    // pub fn get_missing_sid(self: &Arc<Self>, sid: &[usize]) -> Vec<usize> {
+    //     let state = self.state.lock().unwrap();
+    //     let invalid_sid = state.get_invalid_sid();
+    //     sid.iter()
+    //         .filter(|sid| invalid_sid.contains(*sid))
+    //         .map(|x| *x)
+    //         .collect()
+    // }
+
+    pub fn get_config_id(self: &Arc<Self>) -> ConfigId {
+        self.state.lock().unwrap().get_config_id()
     }
 }

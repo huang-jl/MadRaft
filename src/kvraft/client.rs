@@ -35,7 +35,7 @@ impl Clerk {
 pub struct ClerkCore<Req, Rsp> {
     servers: Vec<SocketAddr>,
     rid: AtomicU64, // request id, monotonically increasing
-    cid: String,
+    pub cid: String,
     _mark: std::marker::PhantomData<(Req, Rsp)>,
 }
 
@@ -57,38 +57,52 @@ where
 
     /// Question: What is the diff between kvraft::Error::Timeout and call_timeout's io::Error
     pub async fn call(&self, args: Req) -> Rsp {
+        self.send_to_group(args, &self.servers).await
+    }
+
+    pub async fn send_to_group(&self, args: Req, group: &[SocketAddr]) -> Rsp {
         let net = net::NetLocalHandle::current();
-        let rid = self.rid.fetch_add(1, Ordering::AcqRel);
+        self.increase_rid();
         let args = ClerkReq {
             req: args,
             client: self.cid.clone(),
-            rid,
+            rid: self.rid.load(Ordering::SeqCst),
         };
         let mut old_s;
         let mut s = 0;
         let mut iter_times = 0;
         loop {
-            info!("[Clerk] call S{}, with args = {:?}", s, args);
+            info!(
+                "[Clerk] {} call {:?}, with args = {:?}",
+                self.cid.clone(),
+                group[s],
+                args
+            );
             old_s = s;
             let ret = net
                 .call_timeout::<ClerkReq<Req>, Result<Rsp, Error>>(
-                    self.servers[s],
+                    group[s],
                     args.clone(),
                     Duration::from_millis(500),
                 )
                 .await;
-            info!("[Clerk] call S{} get response = {:?}", s, ret);
+            info!(
+                "[Clerk] {} call {:?} get response = {:?}",
+                self.cid.clone(),
+                group[s],
+                ret
+            );
             if let Ok(ret) = ret {
                 match ret {
                     Ok(reply) => return reply,
                     Err(err) => match err {
                         Error::NotLeader { hint } => s = hint,
-                        Error::Failed => {},
-                        Error::Timeout => s = (s + 1) % self.servers.len(),
+                        Error::Failed => {}
+                        Error::Timeout => s = (s + 1) % group.len(),
                     },
                 }
             } else {
-                s = (s + 1) % self.servers.len();
+                s = (s + 1) % group.len();
             }
             // optimiazation for partition
             if s == old_s {
@@ -97,9 +111,13 @@ where
                 iter_times = 0;
             }
             if iter_times > LOOP_LIMIT {
-                s = (s + 1) % self.servers.len();
+                s = (s + 1) % group.len();
                 iter_times = 0;
             }
         }
+    }
+
+    pub fn increase_rid(&self) {
+        self.rid.fetch_add(1, Ordering::SeqCst);
     }
 }

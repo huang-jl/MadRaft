@@ -21,8 +21,9 @@ async fn static_shards_4b() {
     let t = Tester::new(3, false, None).await;
 
     let ck = t.make_client();
-
+    info!("Start join 0...");
     t.join(0).await;
+    info!("Start join 1...");
     t.join(1).await;
 
     let n = 10;
@@ -30,12 +31,15 @@ async fn static_shards_4b() {
     let kvs = (0..n)
         .map(|i| (i.to_string(), rand_string(20)))
         .collect::<Vec<_>>();
+    info!("Start put kvs...");
     ck.put_kvs(&kvs).await;
     ck.check_kvs(&kvs).await;
+
 
     // make sure that the data really is sharded by
     // shutting down one shard and checking that some
     // Get()s don't succeed.
+    info!("Start shutdown...");
     t.shutdown_group(1);
     t.check_logs(); // forbid snapshots
 
@@ -45,7 +49,8 @@ async fn static_shards_4b() {
         let ck = t.make_client();
         let ndone = ndone.clone();
         handles.push(task::spawn_local(async move {
-            ck.check(k, v).await;
+            ck.check(k.clone(), v.clone()).await;
+            warn!("Check {} {} passed", k, v);
             ndone.fetch_add(1, Ordering::SeqCst);
         }));
     }
@@ -59,6 +64,7 @@ async fn static_shards_4b() {
         "expected 5 completions with one shard dead"
     );
 
+    warn!("G1 back to life");
     // bring the crashed shard/group back to life.
     t.start_group(1).await;
     ck.check_kvs(&kvs).await;
@@ -80,19 +86,23 @@ async fn join_leave_4b() {
         .collect::<Vec<_>>();
     ck.put_kvs(&kvs).await;
     ck.check_kvs(&kvs).await;
-
+    warn!("1 start join");
     t.join(1).await;
     ck.check_append_kvs(&mut kvs, 5).await;
 
+    warn!("0 start leave");
     t.leave(0).await;
     ck.check_append_kvs(&mut kvs, 5).await;
 
+    warn!("start sleep");
     // allow time for shards to transfer.
     time::sleep(Duration::from_secs(1)).await;
 
     t.check_logs();
     t.shutdown_group(0);
 
+    warn!("group 0 shutdown");
+    // allow time for shards to transfer.
     ck.check_kvs(&kvs).await;
 
     t.end();
@@ -114,12 +124,17 @@ async fn snapshot_4b() {
     ck.put_kvs(&kvs).await;
     ck.check_kvs(&kvs).await;
 
+    warn!("start join 1");
     t.join(1).await;
+    warn!("start join 2");
     t.join(2).await;
+    warn!("start leave 0");
     t.leave(0).await;
+    warn!("start check");
     ck.check_append_kvs(&mut kvs, 20).await;
-
+    warn!("start leave 1");
     t.leave(1).await;
+    warn!("start join 0");
     t.join(0).await;
     ck.check_append_kvs(&mut kvs, 20).await;
 
@@ -129,12 +144,15 @@ async fn snapshot_4b() {
     time::sleep(Duration::from_secs(1)).await;
     t.check_logs();
 
+    warn!("shutdown group 100, 101, 102 start");
     for i in 0..3 {
         t.shutdown_group(i);
     }
+    warn!("shutdown group 100, 101, 102 done");
     for i in 0..3 {
         t.start_group(i).await;
     }
+    warn!("restore group 100, 101, 102 done");
     ck.check_kvs(&kvs).await;
 
     t.end();
@@ -155,36 +173,44 @@ async fn miss_change_4b() {
         .collect::<Vec<_>>();
     ck.put_kvs(&kvs).await;
     ck.check_kvs(&kvs).await;
-
+    warn!("Start join 1");
     t.join(1).await;
     for i in 0..3 {
         t.shutdown_server(i, 0);
     }
+    warn!("Shutdown group 0 1 2's server 0 done, start join 2");
     t.join(2).await;
+    warn!("Start leave 0");
     t.leave(0).await;
+    warn!("Start leave 1");
     t.leave(1).await;
 
     ck.check_append_kvs(&mut kvs, 20).await;
 
+    warn!("Start join 1 again");
     t.join(1).await;
     ck.check_append_kvs(&mut kvs, 20).await;
 
     for i in 0..3 {
         t.start_server(i, 0).await;
     }
+    warn!("Group 0 1 2's server 0 start done");
     ck.check_append_kvs(&mut kvs, 20).await;
 
     time::sleep(Duration::from_secs(2)).await;
     for i in 0..3 {
         t.shutdown_server(i, 1);
     }
+    warn!("Shutdown group 0 1 2's server 1 done, start join 0");
     t.join(0).await;
+    warn!("Start leave 2");
     t.leave(2).await;
     ck.check_append_kvs(&mut kvs, 20).await;
 
     for i in 0..3 {
         t.start_server(i, 1).await;
     }
+    warn!("Group 0 1 2's server 1 start done");
     ck.check_kvs(&kvs).await;
 
     t.end();
@@ -238,34 +264,46 @@ async fn concurrent1_4b() {
     let kvs_fut = t.spawn_concurrent_append(kvs, 5, 10);
 
     time::sleep(Duration::from_millis(150)).await;
+    warn!("Start join 1");
     t.join(1).await;
     time::sleep(Duration::from_millis(500)).await;
+    warn!("Start join 2");
     t.join(2).await;
     time::sleep(Duration::from_millis(500)).await;
+    warn!("Start leave 0");
     t.leave(0).await;
 
+    warn!("Start shutdown 0");
     t.shutdown_group(0);
     time::sleep(Duration::from_millis(100)).await;
+    warn!("Start shutdown 1");
     t.shutdown_group(1);
     time::sleep(Duration::from_millis(100)).await;
+    warn!("Start shutdown 2");
     t.shutdown_group(2);
 
+    warn!("Start leave 2");
     t.leave(2).await;
 
     time::sleep(Duration::from_millis(100)).await;
     for i in 0..3 {
         t.start_group(i).await;
     }
-
+    warn!("Restart 0, 1, 2");
     time::sleep(Duration::from_millis(100)).await;
+    warn!("Start join 0 again");
     t.join(0).await;
+    warn!("Start leave 1");
     t.leave(1).await;
     time::sleep(Duration::from_millis(500)).await;
+    warn!("Start join 1 again");
     t.join(1).await;
 
     time::sleep(Duration::from_secs(1)).await;
+    warn!("kvs_fut await start");
     let kvs = kvs_fut.await;
 
+    warn!("kvs_fut await done");
     ck.check_kvs(&kvs).await;
 
     t.end();
