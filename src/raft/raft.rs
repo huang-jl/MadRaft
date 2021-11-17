@@ -205,7 +205,7 @@ impl RaftHandle {
     /// Raft log, since the leader may fail or lose an election.
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
         let res = self.inner.lock().unwrap().start(cmd);
-        self.persist().await.unwrap();
+        self.persist().await.expect("failed to persist");
         res
     }
 
@@ -258,8 +258,12 @@ impl RaftHandle {
     /// (and including) that index. Raft should now trim its log as much as
     /// possible.
     pub async fn snapshot(&self, index: u64, snapshot: &[u8]) -> Result<()> {
-        let mut raft = self.inner.lock().unwrap();
-        raft.snapshot(index, snapshot)
+        {
+            let mut raft = self.inner.lock().unwrap();
+            raft.snapshot(index, snapshot);
+        }
+        self.persist().await.expect("failed to persist");
+        Ok(())
     }
 
     /// save Raft's persistent state to stable storage,
@@ -391,7 +395,7 @@ impl RaftHandle {
             let mut raft = self.inner.lock().unwrap();
             raft.request_install_snapshot(args)
         };
-        self.persist().await.expect("filed to persist");
+        self.persist().await.expect("failed to persist");
         Ok(reply)
     }
 
@@ -412,7 +416,7 @@ impl RaftHandle {
                 }
             }
             let mut rpcs = self.inner.lock().unwrap().send_vote_request();
-            self.persist().await.unwrap();
+            self.persist().await.expect("failed to persist");
             let inner = Arc::clone(&self.inner);
             let this = self.clone();
             task::spawn(async move {
@@ -558,8 +562,7 @@ impl RaftHandle {
     async fn apply_deamon(&self) {
         loop {
             sleep(APPLY_PERIOD).await;
-            // Apply one log at a time
-            // TODO: apply as much as possible?
+            // The applied log must ensure it has been persisted
             self.inner.lock().unwrap().apply_once();
         }
     }
@@ -624,7 +627,10 @@ impl Raft {
             }
             rpcs.push(self.send_single_append_rpc(peer_index));
         }
-        info!("[Append] S{} send append RPC done", self.me);
+        info!(
+            "[Append] S{} send append RPC to {:?} done",
+            self.me, self.peers
+        );
         rpcs
     }
 
@@ -879,7 +885,7 @@ impl Raft {
         rpcs
     }
 
-    fn snapshot(&mut self, log_index: u64, snapshot: &[u8]) -> Result<()> {
+    fn snapshot(&mut self, log_index: u64, snapshot: &[u8]) {
         info!("[Snapshot] S{} snapshot until {}", self.me, log_index);
         if self.state.last_included_index < log_index {
             let idx = self.log_index_to_idx(log_index);
@@ -888,7 +894,6 @@ impl Raft {
             self.update_snapshot(snapshot);
             self.state.last_included_index = log_index;
         }
-        Ok(())
     }
 }
 
@@ -937,7 +942,6 @@ impl Raft {
         }
     }
     fn restore(&mut self, persist: Persist) {
-        info!("[Restore] S{} restore", self.me);
         self.state.term = persist.term;
         self.state.vote_for = persist.vote_for;
         self.logs = persist.logs;
@@ -945,6 +949,7 @@ impl Raft {
         self.state.last_included_index = persist.last_include_index;
         self.state.last_applied = persist.last_include_index;
         self.state.commit_index = persist.last_include_index;
+        info!("[Restore] S{} restore state = {:?}, log num = {}", self.me, self.state, self.logs.len());
     }
     /// Check whether leader's log at AppendRPCArg.prev_index match with local logs
     ///

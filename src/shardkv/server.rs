@@ -59,7 +59,7 @@ impl ShardKvServer {
     async fn check_config_deamon(self: Arc<Self>, ctrl_ck: CtrlerClerk) {
         // Server must check config one by one.
         // Ensure that every tranfer is correct and will not miss any data.
-        loop {
+        'outer: loop {
             time::sleep(CHECK_CONFIG_PERIOD).await;
             if !self.inner.is_leader() {
                 continue;
@@ -95,21 +95,26 @@ impl ShardKvServer {
                 .map(|sid| (sid, prev_config.shards[sid]))
             {
                 if gid == 0 {
-                    self.send_to_my_group(ShardKvOp::new(
-                        Op::Receive {
-                            sid,
-                            kv: HashMap::new(),
-                            client: HashMap::new(),
-                        },
-                        config.num,
-                    ))
-                    .await;
-                    continue;
+                    match self
+                        .send_to_my_group(ShardKvOp::new(
+                            Op::Receive {
+                                sid,
+                                kv: HashMap::new(),
+                                client: HashMap::new(),
+                            },
+                            config.num,
+                        ))
+                        .await
+                    {
+                        Ok(_) => continue,
+                        Err(_) => continue 'outer,
+                    }
                 }
                 info!(
                     "[ShardKv] Gid {} start send Take({}) to gid {}",
                     self.gid, sid, gid
                 );
+                self.kv_ck.increase_rid();
                 loop {
                     match self
                         .kv_ck
@@ -120,12 +125,16 @@ impl ShardKvServer {
                         .await
                     {
                         Reply::Shard { sid, kv, client } => {
-                            self.send_to_my_group(ShardKvOp::new(
-                                Op::Receive { sid, kv, client },
-                                config.num,
-                            ))
-                            .await;
-                            break;
+                            match self
+                                .send_to_my_group(ShardKvOp::new(
+                                    Op::Receive { sid, kv, client },
+                                    config.num,
+                                ))
+                                .await
+                            {
+                                Ok(_) => break,
+                                Err(_) => continue 'outer,
+                            }
                         }
                         Reply::WrongGroup => {
                             // The target server is not ready
@@ -139,19 +148,25 @@ impl ShardKvServer {
                 }
             }
             self.send_to_my_group(ShardKvOp::new(Op::UpdateConfigId, config.num))
-                .await;
+                .await
+                .expect("UpdateConfigId get");
         }
     }
 
-    async fn send_to_my_group(self: &Arc<Self>, op: ShardKvOp) {
+    async fn send_to_my_group(self: &Arc<Self>, op: ShardKvOp) -> Result<(), ()> {
         if !matches!(op.op, Op::Receive { .. } | Op::UpdateConfigId) {
             panic!("KvShard can only send Op::Receive or Op::UpdateConfigId to their own groups");
         }
+        self.kv_ck.increase_rid();
         match self.kv_ck.send_to_group(op.clone(), &self.my_group).await {
-            Reply::Ok => {}
+            Reply::Ok => Ok(()),
+            Reply::WrongGroup if !self.inner.is_leader() => Err(()),
             x => panic!(
-                "[ShardKv] G{} send {:?} to Self get = {:?}",
-                self.gid, op, x
+                "[ShardKv] G{} send {:?} to Self get = {:?}, self.config_id = {}",
+                self.gid,
+                op,
+                x,
+                self.inner.get_config_id(),
             ),
         }
     }
@@ -202,6 +217,10 @@ impl State for ShardKv {
                     self.storage[sid].insert(key, value);
                     Reply::Ok
                 } else {
+                    warn!(
+                        "Wrong group reply happended in {:?}",
+                        Op::Put { key, value }
+                    );
                     Reply::WrongGroup
                 }
             }
@@ -220,6 +239,10 @@ impl State for ShardKv {
                     }
                     Reply::Ok
                 } else {
+                    warn!(
+                        "Wrong group reply happended in {:?}",
+                        Op::Append { key, value }
+                    );
                     Reply::WrongGroup
                 }
             }
@@ -234,6 +257,7 @@ impl State for ShardKv {
                         value: self.storage[sid].get(&key).cloned(),
                     }
                 } else {
+                    warn!("Wrong group reply happended in {:?}", Op::Get { key });
                     Reply::WrongGroup
                 }
             }
@@ -253,6 +277,7 @@ impl State for ShardKv {
                         client: self.client[sid].clone(),
                     }
                 } else {
+                    warn!("Wrong group reply happended in {:?}", cmd.req);
                     Reply::WrongGroup
                 }
             }
@@ -284,6 +309,14 @@ impl State for ShardKv {
                     // duplicated
                     Reply::Ok
                 } else {
+                    warn!(
+                        "Wrong group reply happended in {:?}",
+                        Op::Receive {
+                            sid,
+                            kv,
+                            client: shard_client
+                        }
+                    );
                     Reply::WrongGroup
                 }
             }
@@ -297,13 +330,15 @@ impl State for ShardKv {
         } else {
             &mut self.config_client
         };
-        c.insert(
-            cmd.client,
-            RecentInfo {
-                response: res.clone(),
-                rid: cmd.rid,
-            },
-        );
+        if !matches!(res, Reply::WrongGroup) {
+            c.insert(
+                cmd.client,
+                RecentInfo {
+                    response: res.clone(),
+                    rid: cmd.rid,
+                },
+            );
+        }
         res
     }
 
@@ -319,7 +354,13 @@ impl State for ShardKv {
         };
         match c.get(&req.client) {
             Some(RecentInfo { response, rid }) if *rid == req.rid => Some(response.clone()),
-            _ => None,
+            _ => {
+                if self.is_wrong_group(req) {
+                    Some(Reply::WrongGroup)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -334,6 +375,22 @@ impl ShardKv {
     //         .map(|x| x.0)
     //         .collect()
     // }
+
+    fn is_wrong_group(&self, cmd: &ClerkReq<<ShardKv as State>::Command>) -> bool {
+        let config_id = cmd.req.config_id;
+        let sid = Self::get_sid_from_cmd(cmd);
+        info!(
+            "[ShardKv] Check is wrong group: cmd = {:?}, self.config_id = {}",
+            cmd, self.config_id
+        );
+        match &cmd.req.op {
+            Op::Append { .. } | Op::Get { .. } | Op::Put { .. } => {
+                self.config_id != config_id || !self.own[sid.unwrap()]
+            }
+            Op::Take { .. } | Op::Receive { .. } => config_id > self.config_id + 1,
+            _ => false,
+        }
+    }
 
     pub fn get_config_id(&self) -> ConfigId {
         self.config_id

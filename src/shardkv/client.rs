@@ -152,7 +152,7 @@ impl Clerk {
                     match ret {
                         Ok(reply) => match reply {
                             Reply::WrongGroup => {
-                                self.rid.fetch_add(1, Ordering::SeqCst);
+                                // self.rid.fetch_add(1, Ordering::SeqCst);
                                 break;
                             }
                             x => return x,

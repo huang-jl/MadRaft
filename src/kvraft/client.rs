@@ -57,12 +57,12 @@ where
 
     /// Question: What is the diff between kvraft::Error::Timeout and call_timeout's io::Error
     pub async fn call(&self, args: Req) -> Rsp {
+        self.increase_rid();
         self.send_to_group(args, &self.servers).await
     }
 
     pub async fn send_to_group(&self, args: Req, group: &[SocketAddr]) -> Rsp {
         let net = net::NetLocalHandle::current();
-        self.increase_rid();
         let args = ClerkReq {
             req: args,
             client: self.cid.clone(),
